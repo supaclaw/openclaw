@@ -66,12 +66,15 @@ jobs:
           export PATH="$NODE_BIN:$PATH"
           pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
-      - name: Set package name before build
+      - name: Set package metadata before build
         run: |
           set -euo pipefail
           npm pkg set name='@supaclaw/openclaw'
+          npm pkg set repository.url='https://github.com/supaclaw/openclaw'
           echo "Package name for build:"
           npm pkg get name
+          echo "Repository URL for build:"
+          npm pkg get repository.url
 
       - name: Build dist
         run: pnpm build
@@ -130,12 +133,15 @@ jobs:
             exit 1
           fi
 
-      - name: Set package name for Supaclaw publish
+      - name: Set package metadata for Supaclaw publish
         run: |
           set -euo pipefail
           npm pkg set name='@supaclaw/openclaw'
+          npm pkg set repository.url='https://github.com/supaclaw/openclaw'
           echo "Package name for publish:"
-          node -p "require('./package.json').name"
+          npm pkg get name
+          echo "Repository URL for publish:"
+          npm pkg get repository.url
 
       - name: Check npm package visibility and access
         env:
