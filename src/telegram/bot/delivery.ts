@@ -35,6 +35,7 @@ import type { StickerMetadata, TelegramContext } from "./types.js";
 const PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
 const EMPTY_TEXT_ERR_RE = /message text is empty/i;
 const VOICE_FORBIDDEN_RE = /VOICE_MESSAGES_FORBIDDEN/;
+const CAPTION_TOO_LONG_RE = /caption is too long/i;
 const FILE_TOO_BIG_RE = /file is too big/i;
 const TELEGRAM_MEDIA_SSRF_POLICY = {
   // Telegram file downloads should trust api.telegram.org even when DNS/proxy
@@ -111,7 +112,9 @@ export async function deliverReplies(params: {
       continue;
     }
     const replyToId = replyToMode === "off" ? undefined : resolveTelegramReplyId(reply.replyToId);
-    const replyToMessageIdForPayload =
+    // Evaluate lazily so `hasReplied` is checked at each send site.
+    // When replyToMode is "first", only the first chunk/media item gets the reply-to.
+    const resolveReplyTo = () =>
       replyToId && (replyToMode === "all" || !hasReplied) ? replyToId : undefined;
     const mediaList = reply.mediaUrls?.length
       ? reply.mediaUrls
@@ -124,7 +127,6 @@ export async function deliverReplies(params: {
     const replyMarkup = buildInlineKeyboard(telegramData?.buttons);
     if (mediaList.length === 0) {
       const chunks = chunkText(reply.text || "");
-      let sentTextChunk = false;
       for (let i = 0; i < chunks.length; i += 1) {
         const chunk = chunks[i];
         if (!chunk) {
@@ -132,8 +134,9 @@ export async function deliverReplies(params: {
         }
         // Only attach buttons to the first chunk.
         const shouldAttachButtons = i === 0 && replyMarkup;
+        const replyToForChunk = resolveReplyTo();
         await sendTelegramText(bot, chatId, chunk.html, runtime, {
-          replyToMessageId: replyToMessageIdForPayload,
+          replyToMessageId: replyToForChunk,
           replyQuoteText,
           thread,
           textMode: "html",
@@ -141,11 +144,10 @@ export async function deliverReplies(params: {
           linkPreview,
           replyMarkup: shouldAttachButtons ? replyMarkup : undefined,
         });
-        sentTextChunk = true;
+        if (replyToForChunk && !hasReplied) {
+          hasReplied = true;
+        }
         markDelivered();
-      }
-      if (replyToMessageIdForPayload && !hasReplied && sentTextChunk) {
-        hasReplied = true;
       }
       continue;
     }
@@ -177,7 +179,7 @@ export async function deliverReplies(params: {
         pendingFollowUpText = followUpText;
       }
       first = false;
-      const replyToMessageId = replyToMessageIdForPayload;
+      const replyToMessageId = resolveReplyTo();
       const shouldAttachButtonsToMedia = isFirstMedia && replyMarkup && !followUpText;
       const mediaParams: Record<string, unknown> = {
         caption: htmlCaption,
@@ -230,8 +232,6 @@ export async function deliverReplies(params: {
             markDelivered();
           } catch (voiceErr) {
             // Fall back to text if voice messages are forbidden in this chat.
-            // This happens when the recipient has Telegram Premium privacy settings
-            // that block voice messages (Settings > Privacy > Voice Messages).
             if (isVoiceMessagesForbidden(voiceErr)) {
               const fallbackText = reply.text;
               if (!fallbackText || !fallbackText.trim()) {
@@ -246,17 +246,48 @@ export async function deliverReplies(params: {
                 runtime,
                 text: fallbackText,
                 chunkText,
-                replyToId: replyToMessageIdForPayload,
+                replyToId: resolveReplyTo(),
                 thread,
                 linkPreview,
                 replyMarkup,
                 replyQuoteText,
               });
-              if (replyToMessageIdForPayload && !hasReplied) {
+              if (replyToId && !hasReplied) {
                 hasReplied = true;
               }
               markDelivered();
-              // Skip this media item; continue with next.
+              continue;
+            }
+            if (isCaptionTooLong(voiceErr)) {
+              logVerbose(
+                "telegram sendVoice caption too long; resending voice without caption + text separately",
+              );
+              const noCaptionParams = { ...mediaParams };
+              delete noCaptionParams.caption;
+              delete noCaptionParams.parse_mode;
+              await withTelegramApiErrorLogging({
+                operation: "sendVoice",
+                runtime,
+                fn: () => bot.api.sendVoice(chatId, file, { ...noCaptionParams }),
+              });
+              markDelivered();
+              const fallbackText = reply.text;
+              if (fallbackText?.trim()) {
+                await sendTelegramVoiceFallbackText({
+                  bot,
+                  chatId,
+                  runtime,
+                  text: fallbackText,
+                  chunkText,
+                  replyToId: undefined,
+                  thread,
+                  linkPreview,
+                  replyMarkup,
+                });
+              }
+              if (replyToMessageIdForPayload && !hasReplied) {
+                hasReplied = true;
+              }
               continue;
             }
             throw voiceErr;
@@ -287,20 +318,21 @@ export async function deliverReplies(params: {
         const chunks = chunkText(pendingFollowUpText);
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i];
+          const replyToForFollowUp = resolveReplyTo();
           await sendTelegramText(bot, chatId, chunk.html, runtime, {
-            replyToMessageId: replyToMessageIdForPayload,
+            replyToMessageId: replyToForFollowUp,
             thread,
             textMode: "html",
             plainText: chunk.text,
             linkPreview,
             replyMarkup: i === 0 ? replyMarkup : undefined,
           });
+          if (replyToForFollowUp && !hasReplied) {
+            hasReplied = true;
+          }
           markDelivered();
         }
         pendingFollowUpText = undefined;
-      }
-      if (replyToMessageIdForPayload && !hasReplied) {
-        hasReplied = true;
       }
     }
   }
@@ -463,6 +495,13 @@ function isVoiceMessagesForbidden(err: unknown): boolean {
   return VOICE_FORBIDDEN_RE.test(formatErrorMessage(err));
 }
 
+function isCaptionTooLong(err: unknown): boolean {
+  if (err instanceof GrammyError) {
+    return CAPTION_TOO_LONG_RE.test(err.description);
+  }
+  return CAPTION_TOO_LONG_RE.test(formatErrorMessage(err));
+}
+
 /**
  * Returns true if the error is Telegram's "file is too big" error.
  * This happens when trying to download files >20MB via the Bot API.
@@ -501,10 +540,12 @@ async function sendTelegramVoiceFallbackText(opts: {
   replyQuoteText?: string;
 }): Promise<void> {
   const chunks = opts.chunkText(opts.text);
+  let appliedReplyTo = false;
   for (let i = 0; i < chunks.length; i += 1) {
     const chunk = chunks[i];
+    const replyToForChunk = !appliedReplyTo ? opts.replyToId : undefined;
     await sendTelegramText(opts.bot, opts.chatId, chunk.html, opts.runtime, {
-      replyToMessageId: opts.replyToId,
+      replyToMessageId: replyToForChunk,
       replyQuoteText: opts.replyQuoteText,
       thread: opts.thread,
       textMode: "html",
@@ -512,6 +553,9 @@ async function sendTelegramVoiceFallbackText(opts: {
       linkPreview: opts.linkPreview,
       replyMarkup: i === 0 ? opts.replyMarkup : undefined,
     });
+    if (replyToForChunk) {
+      appliedReplyTo = true;
+    }
   }
 }
 
