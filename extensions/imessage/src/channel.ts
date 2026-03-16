@@ -1,4 +1,3 @@
-import { buildAgentSessionKey, type RoutePeer } from "openclaw/plugin-sdk";
 import {
   buildAccountScopedAllowlistConfigEditor,
   buildAccountScopedDmSecurityPolicy,
@@ -27,6 +26,7 @@ import {
   type ChannelPlugin,
   type ResolvedIMessageAccount,
 } from "openclaw/plugin-sdk/imessage";
+import { buildAgentSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
 import { resolveOutboundSendDep } from "../../../src/infra/outbound/send-deps.js";
 import { buildPassiveProbedChannelStatusSummary } from "../../shared/channel-status-summary.js";
 import { getIMessageRuntime } from "./runtime.js";
