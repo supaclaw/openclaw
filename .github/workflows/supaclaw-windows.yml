@@ -81,6 +81,16 @@ jobs:
       - name: Check release contents
         run: pnpm release:check
 
+      - name: Set package metadata for Supaclaw artifacts
+        run: |
+          set -euo pipefail
+          npm pkg set name='@supaclaw/openclaw'
+          npm pkg set repository.url='https://github.com/supaclaw/openclaw'
+          echo "Package name for artifacts:"
+          npm pkg get name
+          echo "Repository URL for artifacts:"
+          npm pkg get repository.url
+
       - name: Pack npm tarball
         run: |
           mkdir -p artifacts
