@@ -706,10 +706,8 @@ export {
   resolveIMessageAccount,
   type ResolvedIMessageAccount,
 } from "../../extensions/imessage/src/accounts.js";
-export {
-  imessageSetupAdapter,
-  imessageSetupWizard,
-} from "../../extensions/imessage/src/setup-surface.js";
+export { imessageSetupWizard } from "../../extensions/imessage/src/setup-surface.js";
+export { imessageSetupAdapter } from "../../extensions/imessage/src/setup-core.js";
 export {
   looksLikeIMessageTargetId,
   normalizeIMessageMessagingTarget,
@@ -782,10 +780,8 @@ export {
   resolveSignalAccount,
   type ResolvedSignalAccount,
 } from "../../extensions/signal/src/accounts.js";
-export {
-  signalSetupAdapter,
-  signalSetupWizard,
-} from "../../extensions/signal/src/setup-surface.js";
+export { signalSetupWizard } from "../../extensions/signal/src/setup-surface.js";
+export { signalSetupAdapter } from "../../extensions/signal/src/setup-core.js";
 export {
   looksLikeSignalTargetId,
   normalizeSignalMessagingTarget,
