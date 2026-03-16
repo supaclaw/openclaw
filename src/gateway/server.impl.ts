@@ -10,8 +10,9 @@ import { formatCliCommand } from "../cli/command-format.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import { isRestartEnabled } from "../config/commands.js";
 import {
-  CONFIG_PATH,
+  type ConfigFileSnapshot,
   type OpenClawConfig,
+  applyConfigOverrides,
   isNixMode,
   loadConfig,
   migrateLegacyConfig,
@@ -45,7 +46,7 @@ import { enqueueSystemEvent } from "../infra/system-events.js";
 import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
 import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
-import { resolveConfiguredChannelPluginIds } from "../plugins/channel-plugin-ids.js";
+import { resolveConfiguredDeferredChannelPluginIds } from "../plugins/channel-plugin-ids.js";
 import { getGlobalHookRunner, runGlobalGatewayStopSafely } from "../plugins/hook-runner-global.js";
 import { createEmptyPluginRegistry } from "../plugins/registry.js";
 import { createPluginRuntime } from "../plugins/runtime/index.js";
@@ -217,6 +218,73 @@ function applyGatewayAuthOverridesForStartupPreflight(
   };
 }
 
+function assertValidGatewayStartupConfigSnapshot(
+  snapshot: ConfigFileSnapshot,
+  options: { includeDoctorHint?: boolean } = {},
+): void {
+  if (snapshot.valid) {
+    return;
+  }
+  const issues =
+    snapshot.issues.length > 0
+      ? formatConfigIssueLines(snapshot.issues, "", { normalizeRoot: true }).join("\n")
+      : "Unknown validation issue.";
+  const doctorHint = options.includeDoctorHint
+    ? `\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`
+    : "";
+  throw new Error(`Invalid config at ${snapshot.path}.\n${issues}${doctorHint}`);
+}
+
+async function prepareGatewayStartupConfig(params: {
+  configSnapshot: ConfigFileSnapshot;
+  // Keep startup auth/runtime behavior aligned with loadConfig(), which applies
+  // runtime overrides beyond the raw on-disk snapshot.
+  runtimeConfig: OpenClawConfig;
+  authOverride?: GatewayServerOptions["auth"];
+  tailscaleOverride?: GatewayServerOptions["tailscale"];
+  activateRuntimeSecrets: (
+    config: OpenClawConfig,
+    options: { reason: "startup"; activate: boolean },
+  ) => Promise<{ config: OpenClawConfig }>;
+}): Promise<Awaited<ReturnType<typeof ensureGatewayStartupAuth>>> {
+  assertValidGatewayStartupConfigSnapshot(params.configSnapshot);
+
+  // Fail fast before startup auth persists anything if required refs are unresolved.
+  const startupPreflightConfig = applyGatewayAuthOverridesForStartupPreflight(
+    params.runtimeConfig,
+    {
+      auth: params.authOverride,
+      tailscale: params.tailscaleOverride,
+    },
+  );
+  await params.activateRuntimeSecrets(startupPreflightConfig, {
+    reason: "startup",
+    activate: false,
+  });
+
+  const authBootstrap = await ensureGatewayStartupAuth({
+    cfg: params.runtimeConfig,
+    env: process.env,
+    authOverride: params.authOverride,
+    tailscaleOverride: params.tailscaleOverride,
+    persist: true,
+  });
+  const runtimeStartupConfig = applyGatewayAuthOverridesForStartupPreflight(authBootstrap.cfg, {
+    auth: params.authOverride,
+    tailscale: params.tailscaleOverride,
+  });
+  const activatedConfig = (
+    await params.activateRuntimeSecrets(runtimeStartupConfig, {
+      reason: "startup",
+      activate: true,
+    })
+  ).config;
+  return {
+    ...authBootstrap,
+    cfg: activatedConfig,
+  };
+}
+
 export type GatewayServer = {
   close: (opts?: { reason?: string; restartExpectedMs?: number | null }) => Promise<void>;
 };
@@ -315,20 +383,16 @@ export async function startGatewayServer(
   }
 
   configSnapshot = await readConfigFileSnapshot();
-  if (configSnapshot.exists && !configSnapshot.valid) {
-    const issues =
-      configSnapshot.issues.length > 0
-        ? formatConfigIssueLines(configSnapshot.issues, "", { normalizeRoot: true }).join("\n")
-        : "Unknown validation issue.";
-    throw new Error(
-      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`,
-    );
+  if (configSnapshot.exists) {
+    assertValidGatewayStartupConfigSnapshot(configSnapshot, { includeDoctorHint: true });
   }
 
   const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
   if (autoEnable.changes.length > 0) {
     try {
       await writeConfigFile(autoEnable.config);
+      configSnapshot = await readConfigFileSnapshot();
+      assertValidGatewayStartupConfigSnapshot(configSnapshot);
       log.info(
         `gateway: auto-enabled plugins:\n${autoEnable.changes
           .map((entry) => `- ${entry}`)
@@ -405,37 +469,14 @@ export async function startGatewayServer(
       }
     });
 
-  // Fail fast before startup if required refs are unresolved.
   let cfgAtStart: OpenClawConfig;
-  {
-    const freshSnapshot = await readConfigFileSnapshot();
-    if (!freshSnapshot.valid) {
-      const issues =
-        freshSnapshot.issues.length > 0
-          ? formatConfigIssueLines(freshSnapshot.issues, "", { normalizeRoot: true }).join("\n")
-          : "Unknown validation issue.";
-      throw new Error(`Invalid config at ${freshSnapshot.path}.\n${issues}`);
-    }
-    const startupPreflightConfig = applyGatewayAuthOverridesForStartupPreflight(
-      freshSnapshot.config,
-      {
-        auth: opts.auth,
-        tailscale: opts.tailscale,
-      },
-    );
-    await activateRuntimeSecrets(startupPreflightConfig, {
-      reason: "startup",
-      activate: false,
-    });
-  }
-
-  cfgAtStart = loadConfig();
-  const authBootstrap = await ensureGatewayStartupAuth({
-    cfg: cfgAtStart,
-    env: process.env,
+  const startupRuntimeConfig = applyConfigOverrides(configSnapshot.config);
+  const authBootstrap = await prepareGatewayStartupConfig({
+    configSnapshot,
+    runtimeConfig: startupRuntimeConfig,
     authOverride: opts.auth,
     tailscaleOverride: opts.tailscale,
-    persist: true,
+    activateRuntimeSecrets,
   });
   cfgAtStart = authBootstrap.cfg;
   if (authBootstrap.generatedToken) {
@@ -449,12 +490,6 @@ export async function startGatewayServer(
       );
     }
   }
-  cfgAtStart = (
-    await activateRuntimeSecrets(cfgAtStart, {
-      reason: "startup",
-      activate: true,
-    })
-  ).config;
   const diagnosticsEnabled = isDiagnosticsEnabled(cfgAtStart);
   if (diagnosticsEnabled) {
     startDiagnosticHeartbeat();
@@ -474,9 +509,9 @@ export async function startGatewayServer(
   initSubagentRegistry();
   const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
   const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
-  const configuredChannelPluginIds = minimalTestGateway
+  const deferredConfiguredChannelPluginIds = minimalTestGateway
     ? []
-    : resolveConfiguredChannelPluginIds({
+    : resolveConfiguredDeferredChannelPluginIds({
         config: cfgAtStart,
         workspaceDir: defaultWorkspaceDir,
         env: process.env,
@@ -492,7 +527,7 @@ export async function startGatewayServer(
       log,
       coreGatewayHandlers,
       baseMethods,
-      preferSetupRuntimeForChannelPlugins: configuredChannelPluginIds.length > 0,
+      preferSetupRuntimeForChannelPlugins: deferredConfiguredChannelPluginIds.length > 0,
     }));
   }
   const channelLogs = Object.fromEntries(
@@ -951,7 +986,7 @@ export async function startGatewayServer(
 
   let browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> = null;
   if (!minimalTestGateway) {
-    if (configuredChannelPluginIds.length > 0) {
+    if (deferredConfiguredChannelPluginIds.length > 0) {
       ({ pluginRegistry } = loadGatewayPlugins({
         cfg: cfgAtStart,
         workspaceDir: defaultWorkspaceDir,
@@ -1061,7 +1096,7 @@ export async function startGatewayServer(
             warn: (msg) => logReload.warn(msg),
             error: (msg) => logReload.error(msg),
           },
-          watchPath: CONFIG_PATH,
+          watchPath: configSnapshot.path,
         });
       })();
 
