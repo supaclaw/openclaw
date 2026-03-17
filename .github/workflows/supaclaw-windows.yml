@@ -143,6 +143,16 @@ jobs:
             throw "Expected extracted package directory at $packageDir"
           }
 
+          # Keep Supaclaw metadata in the npm tarball, but restore the runtime
+          # package name so bundled executables can still locate the OpenClaw
+          # package root and packaged workspace templates.
+          npm pkg set name='openclaw' --prefix "$packageDir"
+
+          $agentsTemplate = Join-Path $packageDir 'docs\reference\templates\AGENTS.md'
+          if (-not (Test-Path $agentsTemplate)) {
+            throw "Expected packaged workspace template at $agentsTemplate"
+          }
+
           Push-Location $packageDir
           try {
             npm install --omit=dev --ignore-scripts=false --config.engine-strict=false
