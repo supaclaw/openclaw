@@ -26,7 +26,6 @@ const GUARDED_CHANNEL_EXTENSIONS = new Set([
   "msteams",
   "nostr",
   "nextcloud-talk",
-  "nostr",
   "signal",
   "slack",
   "synology-chat",
@@ -119,6 +118,7 @@ const SETUP_BARREL_GUARDS: GuardedSource[] = [
 ];
 
 const LOCAL_EXTENSION_API_BARREL_GUARDS = [
+  "bluebubbles",
   "device-pair",
   "diagnostics-otel",
   "diffs",
@@ -190,8 +190,8 @@ function collectExtensionSourceFiles(): string[] {
         fullPath.includes(".fixture.") ||
         fullPath.includes(".snap") ||
         fullPath.includes("test-support") ||
-        fullPath.endsWith("/api.ts") ||
-        fullPath.endsWith("/runtime-api.ts")
+        entry.name === "api.ts" ||
+        entry.name === "runtime-api.ts"
       ) {
         continue;
       }
@@ -269,7 +269,7 @@ function collectExtensionFiles(extensionId: string): string[] {
         fullPath.includes(".spec.") ||
         fullPath.includes(".fixture.") ||
         fullPath.includes(".snap") ||
-        fullPath.endsWith("/runtime-api.ts")
+        entry.name === "runtime-api.ts"
       ) {
         continue;
       }
