@@ -7,6 +7,10 @@ on:
 
 env:
   DOCKERHUB_REPO: craftslab/openclaw
+  # Bookworm-based Node images can abort at startup on older Docker/seccomp
+  # hosts when glibc thread creation hits clone3 restrictions. Keep the
+  # Supaclaw Docker Hub release image on Bullseye for broader runtime support.
+  SUPACLAW_NODE_BASE_IMAGE: node:24-bullseye
 
 jobs:
   # Build amd64 main image
@@ -45,6 +49,8 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
+          build-args: |
+            OPENCLAW_NODE_BOOKWORM_IMAGE=${{ env.SUPACLAW_NODE_BASE_IMAGE }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
           push: true
@@ -88,6 +94,8 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/arm64
+          build-args: |
+            OPENCLAW_NODE_BOOKWORM_IMAGE=${{ env.SUPACLAW_NODE_BASE_IMAGE }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
           push: true
