@@ -47,7 +47,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
-          outputs: type=image,push=true,oci-mediatypes=false
+          push: true
           cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}-cache:amd64
           cache-to: type=registry,ref=${{ env.DOCKERHUB_REPO }}-cache:amd64,mode=max
           provenance: false
@@ -90,7 +90,7 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
-          outputs: type=image,push=true,oci-mediatypes=false
+          push: true
           cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}-cache:arm64
           cache-to: type=registry,ref=${{ env.DOCKERHUB_REPO }}-cache:arm64,mode=max
           provenance: false
@@ -123,11 +123,13 @@ jobs:
           mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           amd64_image="${{ env.DOCKERHUB_REPO }}@${{ needs.build-main-amd64.outputs.image-digest }}"
           arm64_image="${{ env.DOCKERHUB_REPO }}@${{ needs.build-main-arm64.outputs.image-digest }}"
+          args=()
 
           for tag in "${tags[@]}"; do
             [ -z "$tag" ] && continue
-            docker manifest create "$tag" "$amd64_image" "$arm64_image"
-            docker manifest push --purge "$tag"
+            args+=("-t" "$tag")
           done
+
+          docker buildx imagetools create "${args[@]}" "$amd64_image" "$arm64_image"
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
