@@ -3,12 +3,15 @@ import {
   analyzeShellCommand,
   isWindowsPlatform,
   matchAllowlist,
-  resolveAllowlistCandidatePath,
+  resolveExecutionTargetCandidatePath,
+  resolveExecutionTargetResolution,
   resolveCommandResolutionFromArgv,
+  resolvePolicyTargetCandidatePath,
+  resolvePolicyTargetResolution,
   splitCommandChain,
   type ExecCommandAnalysis,
-  type CommandResolution,
   type ExecCommandSegment,
+  type ExecutableResolution,
 } from "./exec-approvals-analysis.js";
 import type { ExecAllowlistEntry } from "./exec-approvals.js";
 import {
@@ -21,9 +24,11 @@ import { isTrustedSafeBinPath } from "./exec-safe-bin-trust.js";
 import {
   extractShellWrapperInlineCommand,
   isShellWrapperExecutable,
+  normalizeExecutableToken,
 } from "./exec-wrapper-resolution.js";
 import { resolveExecWrapperTrustPlan } from "./exec-wrapper-trust-plan.js";
 import { expandHomePrefix } from "./home-dir.js";
+import { POSIX_INLINE_COMMAND_FLAGS, resolveInlineCommandMatch } from "./shell-inline-command.js";
 
 function hasShellLineContinuation(command: string): boolean {
   return /\\(?:\r\n|\n|\r)/.test(command);
@@ -48,7 +53,7 @@ export function resolveSafeBins(entries?: readonly string[] | null): Set<string>
 
 export function isSafeBinUsage(params: {
   argv: string[];
-  resolution: CommandResolution | null;
+  resolution: ExecutableResolution | null;
   safeBins: Set<string>;
   platform?: string | null;
   trustedSafeBinDirs?: ReadonlySet<string>;
@@ -113,6 +118,7 @@ type ExecAllowlistContext = {
   safeBins: Set<string>;
   safeBinProfiles?: Readonly<Record<string, SafeBinProfile>>;
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
   platform?: string | null;
   trustedSafeBinDirs?: ReadonlySet<string>;
   skillBins?: readonly SkillBinTrustEntry[];
@@ -125,6 +131,7 @@ function pickExecAllowlistContext(params: ExecAllowlistContext): ExecAllowlistCo
     safeBins: params.safeBins,
     safeBinProfiles: params.safeBinProfiles,
     cwd: params.cwd,
+    env: params.env,
     platform: params.platform,
     trustedSafeBinDirs: params.trustedSafeBinDirs,
     skillBins: params.skillBins,
@@ -178,15 +185,16 @@ function isSkillAutoAllowedSegment(params: {
     return false;
   }
   const resolution = params.segment.resolution;
-  if (!resolution?.resolvedPath) {
+  const execution = resolveExecutionTargetResolution(resolution);
+  if (!execution?.resolvedPath) {
     return false;
   }
-  const rawExecutable = resolution.rawExecutable?.trim() ?? "";
+  const rawExecutable = execution.rawExecutable?.trim() ?? "";
   if (!rawExecutable || isPathScopedExecutableToken(rawExecutable)) {
     return false;
   }
-  const executableName = normalizeSkillBinName(resolution.executableName);
-  const resolvedPath = normalizeSkillBinResolvedPath(resolution.resolvedPath);
+  const executableName = normalizeSkillBinName(execution.executableName);
+  const resolvedPath = normalizeSkillBinResolvedPath(execution.resolvedPath);
   if (!executableName || !resolvedPath) {
     return false;
   }
@@ -217,13 +225,26 @@ function evaluateSegments(
         : segment.argv;
     const allowlistSegment =
       effectiveArgv === segment.argv ? segment : { ...segment, argv: effectiveArgv };
-    const candidatePath = resolveAllowlistCandidatePath(segment.resolution, params.cwd);
+    const executableResolution = resolvePolicyTargetResolution(segment.resolution);
+    const candidatePath = resolvePolicyTargetCandidatePath(segment.resolution, params.cwd);
     const candidateResolution =
-      candidatePath && segment.resolution
-        ? { ...segment.resolution, resolvedPath: candidatePath }
-        : segment.resolution;
+      candidatePath && executableResolution
+        ? { ...executableResolution, resolvedPath: candidatePath }
+        : executableResolution;
     const executableMatch = matchAllowlist(params.allowlist, candidateResolution);
     const inlineCommand = extractShellWrapperInlineCommand(allowlistSegment.argv);
+    const shellPositionalArgvCandidatePath = resolveShellWrapperPositionalArgvCandidatePath({
+      segment: allowlistSegment,
+      cwd: params.cwd,
+      env: params.env,
+    });
+    const shellPositionalArgvMatch = shellPositionalArgvCandidatePath
+      ? matchAllowlist(params.allowlist, {
+          rawExecutable: shellPositionalArgvCandidatePath,
+          resolvedPath: shellPositionalArgvCandidatePath,
+          executableName: path.basename(shellPositionalArgvCandidatePath),
+        })
+      : null;
     const shellScriptCandidatePath =
       inlineCommand === null
         ? resolveShellWrapperScriptCandidatePath({
@@ -238,13 +259,13 @@ function evaluateSegments(
           executableName: path.basename(shellScriptCandidatePath),
         })
       : null;
-    const match = executableMatch ?? shellScriptMatch;
+    const match = executableMatch ?? shellPositionalArgvMatch ?? shellScriptMatch;
     if (match) {
       matches.push(match);
     }
     const safe = isSafeBinUsage({
       argv: effectiveArgv,
-      resolution: segment.resolution,
+      resolution: resolveExecutionTargetResolution(segment.resolution),
       safeBins: params.safeBins,
       safeBinProfiles: params.safeBinProfiles,
       platform: params.platform,
@@ -319,11 +340,8 @@ function hasSegmentExecutableMatch(
   segment: ExecCommandSegment,
   predicate: (token: string) => boolean,
 ): boolean {
-  const candidates = [
-    segment.resolution?.executableName,
-    segment.resolution?.rawExecutable,
-    segment.argv[0],
-  ];
+  const execution = resolveExecutionTargetResolution(segment.resolution);
+  const candidates = [execution?.executableName, execution?.rawExecutable, segment.argv[0]];
   for (const candidate of candidates) {
     const trimmed = candidate?.trim();
     if (!trimmed) {
@@ -408,6 +426,64 @@ function resolveShellWrapperScriptCandidatePath(params: {
   return path.resolve(base, expanded);
 }
 
+function resolveShellWrapperPositionalArgvCandidatePath(params: {
+  segment: ExecCommandSegment;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+}): string | undefined {
+  if (!isShellWrapperSegment(params.segment)) {
+    return undefined;
+  }
+
+  const argv = params.segment.argv;
+  if (!Array.isArray(argv) || argv.length < 4) {
+    return undefined;
+  }
+
+  const wrapper = normalizeExecutableToken(argv[0] ?? "");
+  if (!["ash", "bash", "dash", "fish", "ksh", "sh", "zsh"].includes(wrapper)) {
+    return undefined;
+  }
+
+  const inlineMatch = resolveInlineCommandMatch(argv, POSIX_INLINE_COMMAND_FLAGS, {
+    allowCombinedC: true,
+  });
+  if (inlineMatch.valueTokenIndex === null || !inlineMatch.command) {
+    return undefined;
+  }
+  if (!isDirectShellPositionalCarrierInvocation(inlineMatch.command)) {
+    return undefined;
+  }
+
+  const carriedExecutable = argv
+    .slice(inlineMatch.valueTokenIndex + 1)
+    .map((token) => token.trim())
+    .find((token) => token.length > 0);
+  if (!carriedExecutable) {
+    return undefined;
+  }
+
+  const resolution = resolveCommandResolutionFromArgv([carriedExecutable], params.cwd, params.env);
+  return resolveExecutionTargetCandidatePath(resolution, params.cwd);
+}
+
+function isDirectShellPositionalCarrierInvocation(command: string): boolean {
+  const trimmed = command.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+
+  // Keep carrier matching strict: only allow direct `$0` execution with positional arguments.
+  // This prevents payloads like `echo blocked; $0 "$1"` from satisfying allowlist checks.
+  const shellWhitespace = String.raw`[^\S\r\n]+`;
+  const positionalZero = String.raw`(?:\$(?:0|\{0\})|"\$(?:0|\{0\})")`;
+  const positionalArg = String.raw`(?:\$(?:[@*]|[1-9]|\{[@*1-9]\})|"\$(?:[@*]|[1-9]|\{[@*1-9]\})")`;
+  return new RegExp(
+    `^(?:exec${shellWhitespace}(?:--${shellWhitespace})?)?${positionalZero}(?:${shellWhitespace}${positionalArg})*$`,
+    "u",
+  ).test(trimmed);
+}
+
 function collectAllowAlwaysPatterns(params: {
   segment: ExecCommandSegment;
   cwd?: string;
@@ -433,12 +509,21 @@ function collectAllowAlwaysPatterns(params: {
           resolution: resolveCommandResolutionFromArgv(trustPlan.argv, params.cwd, params.env),
         };
 
-  const candidatePath = resolveAllowlistCandidatePath(segment.resolution, params.cwd);
+  const candidatePath = resolveExecutionTargetCandidatePath(segment.resolution, params.cwd);
   if (!candidatePath) {
     return;
   }
   if (!trustPlan.shellWrapperExecutable) {
     params.out.add(candidatePath);
+    return;
+  }
+  const positionalArgvPath = resolveShellWrapperPositionalArgvCandidatePath({
+    segment,
+    cwd: params.cwd,
+    env: params.env,
+  });
+  if (positionalArgvPath) {
+    params.out.add(positionalArgvPath);
     return;
   }
   const inlineCommand =
